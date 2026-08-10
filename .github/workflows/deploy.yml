@@ -1,0 +1,96 @@
+name: Build & Push OpenChamber Docker Image
+
+# Runs every hour, checks the latest GitHub release of openchamber/openchamber,
+# and only builds/pushes a Docker image if that version hasn't been pushed yet.
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour, at minute 0
+  workflow_dispatch:        # allow manual trigger from the Actions tab
+
+env:
+  UPSTREAM_REPO: openchamber/openchamber
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/openchamber
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Get latest upstream release tag
+        id: latest
+        run: |
+          TAG=$(curl -sSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+            | jq -r '.tag_name')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Could not resolve latest release tag" >&2
+            exit 1
+          fi
+          echo "Latest upstream release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if this version was already built
+        id: check
+        run: |
+          if docker manifest inspect "${IMAGE_NAME}:${{ steps.latest.outputs.tag }}" > /dev/null 2>&1; then
+            echo "Image ${IMAGE_NAME}:${{ steps.latest.outputs.tag }} already exists, skipping build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version detected, will build."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream source at release tag
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.latest.outputs.tag }}
+          path: openchamber
+
+      - name: Set up QEMU
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./openchamber
+          file: ./openchamber/Dockerfile
+          push: true
+          # Building for arm64 goes through QEMU emulation and will be
+          # noticeably slower than amd64-only. Drop linux/arm64 below
+          # if you only need amd64 and want faster/cheaper hourly runs.
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.latest.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
+            echo "No new release. Latest tag ${{ steps.latest.outputs.tag }} already published."
+          else
+            echo "Built and pushed ${IMAGE_NAME}:${{ steps.latest.outputs.tag }} and :latest"
+          fi

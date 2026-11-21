@@ -1,0 +1,25 @@
+services:
+  openchamber:
+    # Replace <user> with the GitHub account or org that publishes the image.
+    image: ghcr.io/<user>/openchamber:latest
+    container_name: openchamber
+    restart: unless-stopped
+    ports:
+      - "3000:3000" # OpenChamber UI + API
+      - "4096:4096" # OpenCode UI + API
+    environment:
+      # Required. One password protects both UIs.
+      OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?set OPENCHAMBER_UI_PASSWORD}
+      # Optional: match your host user so bind mounts below are writable.
+      # The entrypoint fixes ownership on start, so these only need setting
+      # when your uid is not 1000.
+      # PUID: 1000
+      # PGID: 1000
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data/openchamber:/home/openchamber/.config/openchamber
+      - ./data/opencode/share:/home/openchamber/.local/share/opencode
+      - ./data/opencode/state:/home/openchamber/.local/state/opencode
+      - ./data/opencode/config:/home/openchamber/.config/opencode
+      - ./data/ssh:/home/openchamber/.ssh
+      - ./workspaces:/home/openchamber/workspaces

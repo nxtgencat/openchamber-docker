@@ -1,0 +1,7 @@
+data/
+workspaces/
+*.log
+versions.json
+.cache/
+.superpowers/
+dist/

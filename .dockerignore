@@ -1,0 +1,13 @@
+# Build context is the repository root; BuildKit reads .dockerignore from here.
+# dist/ is intentionally NOT excluded: the Dockerfile copies the verified
+# OpenCode binary from dist/opencode/opencode.
+.git
+.github
+docs
+data
+workspaces
+node_modules
+.cache
+.superpowers
+**/*.log
+versions.json

@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell and manifest tests
+        run: |
+          set -euo pipefail
+          for t in scripts/test/*-test.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve pins
+        id: pins
+        run: |
+          set -euo pipefail
+          out="$(scripts/resolve-versions.sh "$(python3 -c 'import json;print(json.load(open("docker/package.json"))["dependencies"]["@openchamber/web"])')")"
+          echo "openchamber=$(sed -n 's/^OPENCHAMBER_VERSION=//p' <<<"$out")" >> "$GITHUB_OUTPUT"
+          echo "opencode=$(sed -n 's/^OPENCODE_VERSION=//p' <<<"$out")" >> "$GITHUB_OUTPUT"
+          echo "$out"
+
+      - name: Fetch and verify the OpenCode binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/opencode
+          bin="$(scripts/verify-artifacts.sh "${{ steps.pins.outputs.opencode }}" amd64 dist/opencode-amd64)"
+          install -m 0755 "$bin" dist/opencode/opencode
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: openchamber-selfhost:ci
+          build-args: |
+            OPENCHAMBER_VERSION=${{ steps.pins.outputs.openchamber }}
+            OPENCODE_VERSION=${{ steps.pins.outputs.opencode }}
+            TARGETARCH=amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
+      - name: Image size budget
+        run: |
+          set -euo pipefail
+          size="$(docker image inspect openchamber-selfhost:ci --format '{{.Size}}')"
+          mb=$(( size / 1000 / 1000 ))
+          echo "image size: ${mb} MB"
+          if [ "$size" -gt 1300000000 ]; then
+            echo "image exceeds the 1300 MB budget" >&2
+            exit 1
+          fi
+
+      - name: Dependency load check after pruning
+        run: bash scripts/test/prune-safety-test.sh openchamber-selfhost:ci
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker volume create oc-ci-config >/dev/null
+          docker run -d --name oc-ci \
+            -e OPENCHAMBER_UI_PASSWORD=cipw \
+            -p 13001:3000 -p 14097:4096 \
+            -v oc-ci-config:/home/openchamber/.config/openchamber \
+            openchamber-selfhost:ci
+          for _ in $(seq 1 45); do
+            curl -fsS http://127.0.0.1:13001/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          bash scripts/smoke-test.sh oc-ci cipw 13001 14097
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs oc-ci 2>&1 | tail -100

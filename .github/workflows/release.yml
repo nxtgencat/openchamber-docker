@@ -1,0 +1,327 @@
+name: release
+
+on:
+  schedule:
+    # Poll for a new @openchamber/web release every 6 hours.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      openchamber_version:
+        description: 'OpenChamber version (blank = newest on npm)'
+        required: false
+        type: string
+      opencode_version:
+        description: 'OpenCode version (blank = newest compatible 2.x)'
+        required: false
+        type: string
+  repository_dispatch:
+    types: [openchamber-release]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # The repository is openchamber-docker but the image is published as
+  # <owner>/openchamber, so it cannot be derived from github.repository.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/openchamber
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      openchamber: ${{ steps.pins.outputs.openchamber }}
+      opencode: ${{ steps.pins.outputs.opencode }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      retag: ${{ steps.check.outputs.retag }}
+      pinned: ${{ steps.pins.outputs.pinned }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine target OpenChamber version
+        id: version
+        env:
+          INPUT_OPENCHAMBER: ${{ inputs.openchamber_version }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.openchamber_version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_OPENCHAMBER:-${DISPATCH_VERSION:-}}"
+          if [ -z "$version" ]; then
+            version="$(curl -fsSL https://registry.npmjs.org/@openchamber/web | python3 -c 'import json,sys; print(json.load(sys.stdin)["dist-tags"]["latest"])')"
+          fi
+          case "$version" in
+            *-*) echo "refusing prerelease version: $version" >&2; exit 2 ;;
+          esac
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release version: $version" >&2; exit 2; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Pinned OpenChamber version: $version"
+
+      - name: Log in to GHCR for the existence check
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve compatible pins
+        id: pins
+        env:
+          OPENCHAMBER_VERSION: ${{ steps.version.outputs.version }}
+          INPUT_OPENCODE: ${{ inputs.opencode_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_OPENCODE:-}" ]; then
+            # An explicit override still has to satisfy engines.opencode.
+            oc="$(scripts/check-version.sh "$OPENCHAMBER_VERSION" "$INPUT_OPENCODE")"
+            pinned=true
+          else
+            out="$(scripts/resolve-versions.sh "$OPENCHAMBER_VERSION")"
+            oc="$(sed -n 's/^OPENCODE_VERSION=//p' <<<"$out")"
+            pinned=false
+          fi
+          [ -n "$oc" ] || { echo "could not resolve OpenCode" >&2; exit 2; }
+          echo "openchamber=$OPENCHAMBER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "opencode=$oc" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "OpenCode: $oc"
+
+      - name: Decide what to do
+        id: check
+        env:
+          VERSION: ${{ steps.pins.outputs.openchamber }}
+          PINNED: ${{ steps.pins.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          # Never treat a registry/network failure as "not published"; that
+          # would rebuild and re-push on every poll forever.
+          set +e
+          docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exists=true
+          elif [ "$rc" -eq 1 ] || docker manifest inspect "${IMAGE}:${VERSION}" 2>&1 | grep -qi 'no such manifest\|manifest unknown\|not found'; then
+            exists=false
+          else
+            echo "could not determine whether ${IMAGE}:${VERSION} exists (exit $rc)" >&2
+            docker manifest inspect "${IMAGE}:${VERSION}" 2>&1 | tail -5 >&2
+            exit 3
+          fi
+
+          should_build=true
+          retag=false
+          if [ "$exists" = true ]; then
+            # The manifest exists. If this was a manual pin we still have work
+            # to do: the version tag may exist while latest/major/minor never
+            # got pointed at it. An automatic poll has nothing to do.
+            if [ "$PINNED" = true ]; then
+              should_build=false
+              retag=true
+            else
+              should_build=false
+            fi
+          fi
+          echo "exists=$exists"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "retag=$retag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch and verify the OpenCode binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/opencode
+          bin="$(scripts/verify-artifacts.sh "${{ needs.resolve.outputs.opencode }}" "${{ matrix.arch }}" "dist/opencode-${{ matrix.arch }}")"
+          install -m 0755 "$bin" dist/opencode/opencode
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            OPENCHAMBER_VERSION=${{ needs.resolve.outputs.openchamber }}
+            OPENCODE_VERSION=${{ needs.resolve.outputs.opencode }}
+            TARGETARCH=${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.tags.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Create the multi-arch manifest and tags
+        id: tags
+        env:
+          VERSION: ${{ needs.resolve.outputs.openchamber }}
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          sources=()
+          for f in *; do sources+=("${IMAGE}@sha256:${f}"); done
+          [ "${#sources[@]}" -ge 2 ] || { echo "expected two digests, got ${#sources[@]}" >&2; exit 1; }
+
+          major="${VERSION%%.*}"
+          minor="$(cut -d. -f1,2 <<<"$VERSION")"
+
+          # Moving tags must never point backwards. If a manual dispatch names an
+          # older version, publish only its exact tag.
+          newest="$(scripts/newest-published-tag.sh "${IMAGE}" 2>/dev/null || true)"
+          forward=true
+          if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            forward=false
+            echo "::warning::${VERSION} is older than the published ${newest}; not moving latest/${major}/${minor}"
+          fi
+
+          tags=(--tag "${IMAGE}:${VERSION}")
+          if [ "$forward" = true ]; then
+            tags+=(--tag "${IMAGE}:latest" --tag "${IMAGE}:${major}" --tag "${IMAGE}:${minor}")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          echo "digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '\"')" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [resolve, merge]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the GitHub release
+        env:
+          VERSION: ${{ needs.resolve.outputs.openchamber }}
+          OC_VERSION: ${{ needs.resolve.outputs.opencode }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          notes="$(mktemp)"
+          cat > "$notes" <<EOF
+          OpenChamber \`${VERSION}\` with OpenCode \`${OC_VERSION}\`.
+
+          \`\`\`
+          docker pull ${IMAGE}:${VERSION}
+          \`\`\`
+
+          OpenChamber: <http://localhost:3000> · OpenCode: <http://localhost:4096>
+
+          - Platforms: linux/amd64, linux/arm64
+          - Digest: \`${DIGEST}\`
+          - Tags: \`latest\`, \`${VERSION%%.*}\`, \`$(cut -d. -f1,2 <<<"$VERSION")\`, \`${VERSION}\`
+
+          Run it:
+
+          \`\`\`bash
+          docker run -d --name openchamber -p 3000:3000 -p 4096:4096 \\
+            -e OPENCHAMBER_UI_PASSWORD='change-me' \\
+            -v openchamber-config:/home/openchamber/.config/openchamber \\
+            -v opencode-data:/home/openchamber/.local/share/opencode \\
+            ${IMAGE}:${VERSION}
+          \`\`\`
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file "$notes"
+          else
+            gh release create "$tag" --title "OpenChamber ${VERSION}" --notes-file "$notes"
+          fi
+
+  retag:
+    needs: [resolve]
+    if: needs.resolve.outputs.retag == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point the moving tags at an already published version
+        env:
+          VERSION: ${{ needs.resolve.outputs.openchamber }}
+        run: |
+          set -euo pipefail
+          major="${VERSION%%.*}"
+          minor="$(cut -d. -f1,2 <<<"$VERSION")"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" --tag "${IMAGE}:${major}" --tag "${IMAGE}:${minor}" \
+            "${IMAGE}:${VERSION}"
+
+  noop:
+    needs: [resolve]
+    if: needs.resolve.outputs.should_build != 'true' && needs.resolve.outputs.retag != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "OpenChamber ${{ needs.resolve.outputs.openchamber }} is already published; nothing to do."
